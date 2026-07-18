@@ -1,0 +1,30 @@
+name: ESP Anywhere Builder
+description: Build, sign and publish ESP Anywhere OTA firmware from ESPHome YAML.
+version: 0.1.0
+slug: esp_anywhere_builder
+url: https://github.com/kaziksiwy-stack/esp-anywhere-addons
+arch:
+  - amd64
+startup: application
+boot: auto
+init: false
+ingress: true
+ingress_port: 8099
+ingress_entry: /
+panel_icon: mdi:chip
+panel_title: ESP Anywhere Builder
+panel_admin: true
+stage: experimental
+homeassistant_api: false
+hassio_api: false
+host_network: false
+privileged: []
+full_access: false
+docker_api: false
+tmpfs: true
+map:
+  - type: homeassistant_config
+    read_only: true
+    path: /homeassistant
+options: {}
+schema: {}

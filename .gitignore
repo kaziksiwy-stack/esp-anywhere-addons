@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.esphome/
+build/
+work/
+*.bin
+*.elf
+*.pem
+*.key
+secrets.yaml
