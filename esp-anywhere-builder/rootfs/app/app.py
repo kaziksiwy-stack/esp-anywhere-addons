@@ -22,6 +22,7 @@ from uuid import uuid4
 
 import rfc8785
 import yaml
+from ha_verifier.manifest import parse_and_verify_manifest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
@@ -254,6 +255,10 @@ class Builder:
     def _build(self, job: Job, directory: Path) -> None:
         if not TOKEN_FILE.is_file() or TOKEN_FILE.is_symlink(): raise ValueError("GitHub token is not configured")
         if not KEY_FILE.is_file() or KEY_FILE.is_symlink(): raise ValueError("Signing key is not configured")
+        signing_key_pem = KEY_FILE.read_bytes()
+        signing_key = serialization.load_pem_private_key(signing_key_pem, password=None)
+        if not isinstance(signing_key, Ed25519PrivateKey): raise ValueError("Signing key must be Ed25519")
+        signing_public = base64.b64encode(signing_key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode("ascii")
         settings = load_settings(); repository = settings["repository"]
         secrets = scalar_secrets(CONFIG_DIR / "secrets.yaml")
         config_copy = directory / "config"; self._copy_config(config_copy)
@@ -282,13 +287,16 @@ class Builder:
         self._run(["git", "commit", "-m", f"Add ESP Anywhere firmware {version}"], cwd=repo)
         firmware_commit = self._run(["git", "rev-parse", "HEAD"], cwd=repo).strip()
         self._stage(job, "signing")
-        document = self._manifest(version, profile, firmware_commit, firmware, repository, settings["key_id"])
-        manifest_path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
-        self._verify(document)
+        document = self._manifest(version, profile, firmware_commit, firmware, repository, settings["key_id"], signing_key)
+        final_manifest = (json.dumps(document, indent=2) + "\n").encode("utf-8")
+        parse_and_verify_manifest(final_manifest, trusted_key_id=settings["key_id"], trusted_public_key=signing_public, expected_hardware_profile=profile)
+        if KEY_FILE.read_bytes() != signing_key_pem: raise RuntimeError("Signing key changed during build")
+        manifest_path.write_bytes(final_manifest)
         self._run(["git", "add", "manifest.json"], cwd=repo)
         self._run(["git", "commit", "-m", f"Publish signed manifest for {version}"], cwd=repo)
         tag = f"firmware-v{version}"; self._run(["git", "tag", tag], cwd=repo)
         self._stage(job, "publishing")
+        if KEY_FILE.read_bytes() != signing_key_pem: raise RuntimeError("Signing key changed before publication")
         env = self._git_env()
         self._run(["git", "push", "origin", "main"], cwd=repo, env=env)
         self._run(["git", "push", "origin", f"refs/tags/{tag}:refs/tags/{tag}"], cwd=repo, env=env)
@@ -329,9 +337,8 @@ class Builder:
         return env
 
     @staticmethod
-    def _manifest(version: str, profile: str, commit: str, firmware: Path, repository: str, key_id: str) -> dict[str, Any]:
+    def _manifest(version: str, profile: str, commit: str, firmware: Path, repository: str, key_id: str, private: Ed25519PrivateKey) -> dict[str, Any]:
         document: dict[str, Any] = {"schema_version": 1, "project": "esp-anywhere", "version": version, "protocol_version": "1.0", "channel": "stable", "hardware_profile": profile, "chip_family": "ESP32-C3", "framework": {"name": "esp-idf", "version": "5.5.4"}, "build_id": f"{version}-{commit[:12]}", "git_commit": commit, "published_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"), "release_url": f"https://github.com/{repository}/releases/tag/firmware-v{version}", "summary": f"ESP Anywhere firmware {version}", "firmware": {"url": f"https://raw.githubusercontent.com/{repository}/{commit}/{firmware.name}", "size": firmware.stat().st_size, "sha256": hashlib.sha256(firmware.read_bytes()).hexdigest()}, "security": {"key_id": key_id}}
-        private = serialization.load_pem_private_key(KEY_FILE.read_bytes(), password=None)
         document["security"]["signature"] = base64.b64encode(private.sign(rfc8785.dumps(document))).decode("ascii")
         return document
 
@@ -385,6 +392,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(token, str) or not 20 <= len(token) <= 512 or any(c.isspace() for c in token): raise ValueError("Invalid token")
                 atomic_private_file(TOKEN_FILE, token.encode()); self._json(HTTPStatus.OK, {"stored": True})
             elif path == "/api/settings/key/import":
+                with self.builder.lock:
+                    if self.builder.active_devices: raise RuntimeError("Cannot change signing key during an active build")
                 pem, key_id = raw.get("pem"), raw.get("key_id")
                 if not isinstance(pem, str) or len(pem) > 16384 or not isinstance(key_id, str) or KEY_ID_PATTERN.fullmatch(key_id) is None: raise ValueError("Invalid key import")
                 key = serialization.load_pem_private_key(pem.encode(), password=None)
