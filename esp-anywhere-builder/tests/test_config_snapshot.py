@@ -23,7 +23,7 @@ class ConfigSnapshotTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary); source = root / "source"; source.mkdir()
             yaml_bytes = b"mqtt:\n  certificate_authority: !secret mqtt_ca_certificate\n"
-            secrets_bytes = ("mqtt_ca_certificate: |-\n" + "".join("  " + line + "\n" for line in pem.splitlines())).encode()
+            secrets_bytes = ("mqtt_ca_certificate: >-\n" + "".join("  " + line + "\n" for line in pem.splitlines())).encode()
             (source / "device.yaml").write_bytes(yaml_bytes)
             (source / "secrets.yaml").write_bytes(secrets_bytes)
             previous = app.CONFIG_DIR; app.CONFIG_DIR = source
@@ -31,7 +31,11 @@ class ConfigSnapshotTest(unittest.TestCase):
                 destination = root / "snapshot"
                 app.Builder.__new__(app.Builder)._copy_config(destination, "device.yaml")
                 self.assertEqual((destination / "device.yaml").read_bytes(), yaml_bytes)
-                self.assertEqual((destination / "secrets.yaml").read_bytes(), secrets_bytes)
+                snapshot = (destination / "secrets.yaml").read_bytes()
+                self.assertNotEqual(snapshot, secrets_bytes)
+                self.assertIn(b"-----BEGIN CERTIFICATE-----\n", snapshot)
+                self.assertIn(b"\n  -----END CERTIFICATE-----\n", snapshot)
+                self.assertEqual(app.yaml.safe_load(snapshot)["mqtt_ca_certificate"], pem)
                 (source / "secrets.yaml").write_text("mqtt_ca_certificate: not-a-certificate\n")
                 with self.assertRaisesRegex(ValueError, "not valid X.509 PEM"):
                     app.Builder.__new__(app.Builder)._copy_config(root / "invalid", "device.yaml")

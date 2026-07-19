@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.3
+
+- Canonicalize the resolved MQTT CA to strict multiline PEM before ESPHome compilation.
+- Prevent folded YAML certificate blocks from producing firmware rejected by mbedTLS.
+
 ## 0.1.2
 
 - Snapshot the selected YAML and `secrets.yaml` byte-for-byte for every build.

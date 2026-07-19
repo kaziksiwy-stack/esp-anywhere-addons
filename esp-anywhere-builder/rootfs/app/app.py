@@ -130,8 +130,8 @@ def redact(value: str, secrets: list[str] | None = None) -> str:
     return "\n".join(line[:400] for line in text.splitlines()[-80:])[:12000]
 
 
-def validate_mqtt_ca(yaml_bytes: bytes, secrets_bytes: bytes) -> None:
-    """Resolve and validate the MQTT CA without returning or logging its value."""
+def canonicalize_mqtt_ca(yaml_bytes: bytes, secrets_bytes: bytes) -> bytes:
+    """Return a working secrets file with an mbedTLS-compatible canonical CA PEM."""
     try:
         names = CA_SECRET_LINE.findall(yaml_bytes.decode("utf-8"))
         if len(names) != 1:
@@ -143,9 +143,21 @@ def validate_mqtt_ca(yaml_bytes: bytes, secrets_bytes: bytes) -> None:
         if not isinstance(certificate, str) or not certificate.strip():
             raise ValueError("MQTT CA secret is missing")
         try:
-            x509.load_pem_x509_certificate(certificate.encode("utf-8"))
+            parsed = x509.load_pem_x509_certificate(certificate.encode("utf-8"))
         except Exception as exc:
             raise ValueError("MQTT CA certificate is not valid X.509 PEM") from exc
+        secrets[names[0]] = parsed.public_bytes(serialization.Encoding.PEM).decode("ascii")
+
+        class LiteralDumper(yaml.SafeDumper):
+            pass
+
+        def represent_string(dumper: yaml.SafeDumper, value: str):
+            style = "|" if "\n" in value else None
+            return dumper.represent_scalar("tag:yaml.org,2002:str", value, style=style)
+
+        LiteralDumper.add_representer(str, represent_string)
+        rendered = yaml.dump(secrets, Dumper=LiteralDumper, sort_keys=False, allow_unicode=True)
+        return rendered.encode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError("ESPHome configuration is not valid UTF-8") from exc
 
@@ -334,7 +346,7 @@ class Builder:
         if not source_secrets.is_file() or source_secrets.is_symlink(): raise ValueError("ESPHome secrets file is unavailable")
         yaml_bytes = source_yaml.read_bytes()
         secrets_bytes = source_secrets.read_bytes()
-        validate_mqtt_ca(yaml_bytes, secrets_bytes)
+        secrets_bytes = canonicalize_mqtt_ca(yaml_bytes, secrets_bytes)
         shutil.copytree(CONFIG_DIR, destination, ignore=shutil.ignore_patterns(".git", ".esphome", "build", "*.bin", "*.elf", "*.pem", "*.key"))
         atomic_private_file(destination / yaml_file, yaml_bytes)
         atomic_private_file(destination / "secrets.yaml", secrets_bytes)
