@@ -22,6 +22,7 @@ from uuid import uuid4
 
 import rfc8785
 import yaml
+from cryptography import x509
 from ha_verifier.manifest import parse_and_verify_manifest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
@@ -35,6 +36,7 @@ DEVICE_LINE = re.compile(r"(?m)^  device_id: ([a-z0-9_-]+)\s*$")
 INITIAL_OTA_LINE = re.compile(r'(?m)^    initial_value: "OTA [^"]+ OK"\s*$')
 REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 KEY_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{2,63}$")
+CA_SECRET_LINE = re.compile(r"(?m)^\s*certificate_authority:\s*!secret\s+([A-Za-z0-9_]+)\s*$")
 STAGES = {"validating", "compiling", "signing", "publishing", "ready", "failed"}
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 CONFIG_DIR = Path(os.environ.get("ESPHOME_CONFIG_DIR", "/homeassistant/esphome"))
@@ -128,6 +130,26 @@ def redact(value: str, secrets: list[str] | None = None) -> str:
     return "\n".join(line[:400] for line in text.splitlines()[-80:])[:12000]
 
 
+def validate_mqtt_ca(yaml_bytes: bytes, secrets_bytes: bytes) -> None:
+    """Resolve and validate the MQTT CA without returning or logging its value."""
+    try:
+        names = CA_SECRET_LINE.findall(yaml_bytes.decode("utf-8"))
+        if len(names) != 1:
+            raise ValueError("YAML must reference exactly one MQTT CA secret")
+        secrets = yaml.safe_load(secrets_bytes.decode("utf-8"))
+        if not isinstance(secrets, dict):
+            raise ValueError("ESPHome secrets file is invalid")
+        certificate = secrets.get(names[0])
+        if not isinstance(certificate, str) or not certificate.strip():
+            raise ValueError("MQTT CA secret is missing")
+        try:
+            x509.load_pem_x509_certificate(certificate.encode("utf-8"))
+        except Exception as exc:
+            raise ValueError("MQTT CA certificate is not valid X.509 PEM") from exc
+    except UnicodeDecodeError as exc:
+        raise ValueError("ESPHome configuration is not valid UTF-8") from exc
+
+
 def public_key_info() -> dict[str, Any]:
     settings = load_settings()
     if not KEY_FILE.is_file():
@@ -219,7 +241,7 @@ class Builder:
         secrets = scalar_secrets(CONFIG_DIR / "secrets.yaml")
         try:
             config_copy = job_dir / "config"
-            self._copy_config(config_copy)
+            self._copy_config(config_copy, yaml_file)
             source = config_copy / yaml_file
             if not source.is_file() or source.is_symlink(): raise ValueError("YAML does not exist")
             text = source.read_text(encoding="utf-8")
@@ -261,7 +283,7 @@ class Builder:
         signing_public = base64.b64encode(signing_key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode("ascii")
         settings = load_settings(); repository = settings["repository"]
         secrets = scalar_secrets(CONFIG_DIR / "secrets.yaml")
-        config_copy = directory / "config"; self._copy_config(config_copy)
+        config_copy = directory / "config"; self._copy_config(config_copy, job.yaml_file)
         yaml_path = config_copy / job.yaml_file
         if not yaml_path.is_file() or yaml_path.is_symlink(): raise ValueError("YAML does not exist")
         repo = directory / "ota"
@@ -277,6 +299,7 @@ class Builder:
         yaml_path.write_text(rendered, encoding="utf-8")
         self._append(job, self._run(["esphome", "config", str(yaml_path)], cwd=config_copy, secrets=secrets))
         self._stage(job, "compiling")
+        shutil.rmtree(config_copy / ".esphome", ignore_errors=True)
         self._append(job, self._run(["esphome", "compile", str(yaml_path)], cwd=config_copy, secrets=secrets))
         candidates = list(config_copy.rglob("firmware.ota.bin"))
         if len(candidates) != 1: raise ValueError("Build did not produce exactly one firmware.ota.bin")
@@ -303,9 +326,18 @@ class Builder:
         self._create_release(repository, tag, version, firmware_name)
         self._stage(job, "ready")
 
-    def _copy_config(self, destination: Path) -> None:
+    def _copy_config(self, destination: Path, yaml_file: str) -> None:
         if not CONFIG_DIR.is_dir() or CONFIG_DIR.is_symlink(): raise ValueError("ESPHome config directory is unavailable")
+        source_yaml = CONFIG_DIR / yaml_file
+        source_secrets = CONFIG_DIR / "secrets.yaml"
+        if not source_yaml.is_file() or source_yaml.is_symlink(): raise ValueError("YAML does not exist")
+        if not source_secrets.is_file() or source_secrets.is_symlink(): raise ValueError("ESPHome secrets file is unavailable")
+        yaml_bytes = source_yaml.read_bytes()
+        secrets_bytes = source_secrets.read_bytes()
+        validate_mqtt_ca(yaml_bytes, secrets_bytes)
         shutil.copytree(CONFIG_DIR, destination, ignore=shutil.ignore_patterns(".git", ".esphome", "build", "*.bin", "*.elf", "*.pem", "*.key"))
+        atomic_private_file(destination / yaml_file, yaml_bytes)
+        atomic_private_file(destination / "secrets.yaml", secrets_bytes)
 
     def _stage(self, job: Job, stage: str, error: str | None = None) -> None:
         if stage not in STAGES: raise ValueError("Invalid stage")

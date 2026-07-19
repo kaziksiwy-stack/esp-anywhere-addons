@@ -1,6 +1,6 @@
 name: ESP Anywhere Builder
 description: Build, sign and publish ESP Anywhere OTA firmware from ESPHome YAML.
-version: 0.1.1
+version: 0.1.2
 slug: esp_anywhere_builder
 url: https://github.com/kaziksiwy-stack/esp-anywhere-addons
 arch:
